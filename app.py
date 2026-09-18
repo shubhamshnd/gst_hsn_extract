@@ -9,7 +9,12 @@ import pandas as pd
 import ddddocr  # must be imported BEFORE PyQt5 - the reverse order segfaults on Windows
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException
+from selenium.common.exceptions import (ElementClickInterceptedException,
+                                        InvalidSessionIdException, NoSuchWindowException,
+                                        TimeoutException)
+
+# Retrying cannot bring these back - the browser is gone. Abort instead of spinning.
+SESSION_DEAD = (InvalidSessionIdException, NoSuchWindowException)
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -34,10 +39,12 @@ QTextEdit { background: #ffffff; border: 1px solid #d0d3d8; border-radius: 5px;
 """
 
 SAMPLE_DIR = "captcha_samples"
-# ddddocr lands roughly 1 read in 6, and a retry now costs ~1.3s because a refused
-# captcha refreshes in place. 8 tries left a 1-in-5 chance of losing a GSTIN outright;
-# 25 puts that near 1 in 100, for ~8s per GSTIN on average and ~33s worst case.
-MAX_CAPTCHA_RETRIES = 25
+# Measured across live runs, ddddocr lands about 1 read in 10 - worse than a small
+# sample first suggested. A retry costs ~0.9s because a refused captcha refreshes in
+# place, so retries are cheap and worth spending: 40 leaves roughly a 2% chance of losing
+# a GSTIN, for ~10s each on average. A GSTIN that still fails is simply not recorded, so
+# the next run picks it up again.
+MAX_CAPTCHA_RETRIES = 40
 
 # The running store. Append-only CSV rather than xlsx on purpose: appending a row is one
 # line and survives a crash mid-run, where rewriting a whole workbook every scrape does not.
@@ -244,6 +251,30 @@ def append_results(gstin, company, profile, hsn_rows):
     return len(records)
 
 
+def normalise_gstin(value):
+    """GSTINs are compared across an input sheet and the store, so spelling must match."""
+    return str(value).strip().upper()
+
+
+def scraped_today(when=None):
+    """GSTINs already in the store bearing today's date.
+
+    Restarting a run should resume, not start over. Scoped to the day rather than to all
+    time so a GSTIN can still be refreshed tomorrow.
+    """
+    if not os.path.exists(RESULTS_FILE):
+        return set()
+    day = when or time.strftime("%Y-%m-%d")
+    try:
+        df = pd.read_csv(RESULTS_FILE, dtype=str)
+    except Exception:
+        return set()          # an unreadable store must not block a run
+    if "Timestamp" not in df.columns or "GSTIN" not in df.columns:
+        return set()
+    today = df[df["Timestamp"].fillna("").str.startswith(day)]
+    return {normalise_gstin(g) for g in today["GSTIN"].dropna()}
+
+
 def export_to_excel(path):
     """Dump the whole store to a workbook. Returns how many rows went out."""
     # dtype=str or pandas reads 00440177 as the number 440177 and the leading zeros,
@@ -298,6 +329,13 @@ class ScraperThread(QThread):
         done = 0
         self.count_signal.emit(0, total)
 
+        # Resume rather than restart. Anything already scraped today is skipped, so
+        # stopping and starting again picks up where the last run left off.
+        done_today = scraped_today()
+        if done_today:
+            self.progress_signal.emit(
+                f"Resuming - {len(done_today)} GSTIN(s) already scraped today will be skipped.")
+
         for index, row in df.iterrows():
             if not self._is_running:
                 self.progress_signal.emit("Process stopped by user.")
@@ -305,6 +343,13 @@ class ScraperThread(QThread):
 
             gstin = row.get("GSTIN")
             if pd.isna(gstin):
+                continue
+            gstin = normalise_gstin(gstin)
+
+            if gstin in done_today:
+                done += 1
+                self.count_signal.emit(done, total)
+                self.progress_signal.emit(f"Skipping {gstin} - already scraped today")
                 continue
 
             try:
@@ -320,6 +365,11 @@ class ScraperThread(QThread):
                 # The captcha is not in the DOM until the GSTIN is submitted once.
                 if not click_search(driver, wait):
                     raise TimeoutException("SEARCH stayed covered by the loading overlay")
+            except SESSION_DEAD:
+                self.progress_signal.emit(
+                    "Browser window closed or crashed - stopping. "
+                    "Everything scraped so far is saved; press Start to resume.")
+                break
             except Exception as e:
                 self.progress_signal.emit(f"Error on {gstin}: {str(e)}")
                 done += 1
@@ -388,11 +438,20 @@ class ScraperThread(QThread):
 
                     # Save immediately to prevent data loss
                     written = append_results(gstin, row.get("Company"), profile, hsn_rows)
+                    # Covers a GSTIN listed twice in the same sheet, not just a restart.
+                    done_today.add(gstin)
 
                     name = profile.get("Legal Name of Business", "")
                     self.progress_signal.emit(
                         f"Scraped {gstin} {('- ' + name) if name else ''} "
                         f"({len(hsn_rows)} HSN, {written} row(s), attempt {attempt})")
+                    break
+
+                except SESSION_DEAD:
+                    self.progress_signal.emit(
+                        "Browser window closed or crashed - stopping. "
+                        "Everything scraped so far is saved; press Start to resume.")
+                    self._is_running = False
                     break
 
                 except Exception as e:
@@ -477,6 +536,9 @@ class GSTScraperUI(QWidget):
 
         self.log_window = QTextEdit()
         self.log_window.setReadOnly(True)
+        # A long run emits up to MAX_CAPTCHA_RETRIES lines per GSTIN. Unbounded, the
+        # widget slows to a crawl after a few thousand; old lines are not worth that.
+        self.log_window.document().setMaximumBlockCount(500)
         layout.addWidget(self.log_window, 1)
 
         self.setLayout(layout)

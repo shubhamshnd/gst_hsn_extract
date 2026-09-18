@@ -71,6 +71,16 @@ Jurisdiction fields are multi-line on the portal and are joined with ` | `, e.g.
 **Export Everything to Excel** dumps the entire store to a workbook, including repeat
 scrapes of the same GSTIN — nothing is filtered or deduplicated.
 
+### Stopping and resuming
+
+Stop any time. On the next Start, every GSTIN already carrying **today's** date in the
+store is skipped, and the log opens with `Resuming — N GSTIN(s) already scraped today
+will be skipped`. The run picks up where it left off rather than starting over.
+
+Scoping to the day means the same list can be refreshed tomorrow without editing
+anything. To force a re-scrape sooner, delete or rename `gst_hsn_results.csv` — it is the
+only state involved.
+
 > Read the CSV back with `dtype=str`. SAC codes like `00440177` have meaningful leading
 > zeros, and pandas will happily turn them into `440177` otherwise. `export_to_excel`
 > already does this.
@@ -87,13 +97,17 @@ captcha does not navigate away. The portal keeps the GSTIN filled, clears the ca
 and swaps in a fresh image, so a wrong guess is one round trip and doubles as the cheapest
 way to get a new captcha. Reloading the page instead would cost three.
 
-So the page loads **once per GSTIN**, and all `MAX_CAPTCHA_RETRIES` (25) attempts happen
-in place at roughly 1.3s each.
+So the page loads **once per GSTIN**, and all `MAX_CAPTCHA_RETRIES` (40) attempts happen
+in place at roughly 0.9s each.
 
-**The generic model is weak here: roughly 1 in 6 reads is exact.** Expect a run of
-`captcha 'NNNNNN' rejected` lines before each success — that is normal, not a failure.
-25 attempts puts the odds of losing a GSTIN near 1 in 100, for about 8s per GSTIN on
-average. Guesses ending in several zeros are padded partial reads.
+**The generic model is weak here: measured across live runs, about 1 read in 10 is
+exact.** Expect a long run of `captcha 'NNNNNN' rejected` lines before each success —
+that is normal, not a failure. 40 attempts leaves roughly a 2% chance of losing a GSTIN,
+at about 10s per GSTIN on average. Guesses ending in several zeros are padded partial
+reads.
+
+A GSTIN that exhausts its retries is **not** written to the store, so the next run picks
+it up again automatically.
 
 Success and refusal are detected by watching for the taxpayer panel and the portal's
 `.err` message at the same time, so a refusal is noticed the moment it appears instead of

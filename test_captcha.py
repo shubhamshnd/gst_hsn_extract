@@ -138,6 +138,27 @@ def test_type_captcha_retries_until_the_value_sticks():
     assert app.type_captcha(dead, "123456") is False, "must report failure, not submit blank"
 
 
+def test_scraped_today_lets_a_restart_resume():
+    tmp = tempfile.mkdtemp()
+    original, app.RESULTS_FILE = app.RESULTS_FILE, os.path.join(tmp, "results.csv")
+    try:
+        assert app.scraped_today() == set(), "no store yet -> nothing to skip"
+
+        app.append_results("27AACCJ9361Q1ZS", "JSW", {}, [("Services", "00440177", "PORT")])
+        app.append_results("29BBBBB1111B2Z6", "Other", {}, [])
+        today = app.scraped_today()
+        assert today == {"27AACCJ9361Q1ZS", "29BBBBB1111B2Z6"}, today
+
+        # Case and stray whitespace in an input sheet must still match the store.
+        assert app.normalise_gstin("  27aaccj9361q1zs ") in today
+
+        # Yesterday's rows must not suppress a fresh scrape.
+        assert app.scraped_today(when="1999-01-01") == set()
+    finally:
+        app.RESULTS_FILE = original
+        shutil.rmtree(tmp)
+
+
 def test_store_writes_one_row_per_hsn_and_exports_everything():
     profile = {
         "Legal Name of Business": "JSW DHARAMTAR PORT PRIVATE LIMITED",
