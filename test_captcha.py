@@ -12,18 +12,25 @@ import pandas as pd
 import app
 
 
-def test_solve_rejects_garbage():
+def _is_submittable(guess):
+    """The portal only accepts six digits, so that is all solve_captcha may ever return."""
+    return len(guess) == 6 and guess.isdigit()
+
+
+def test_solve_always_returns_something_submittable():
+    # Even unreadable input must produce a guess: a rejected guess is how the loop gets a
+    # fresh captcha, and returning nothing would strand it with no way to move on.
     blank = cv2.imencode('.png', np.full((40, 150, 3), 255, np.uint8))[1].tobytes()
-    assert app.solve_captcha(blank) == ""
-    assert app.solve_captcha(b"not a png") == ""
+    assert _is_submittable(app.solve_captcha(blank))
+    assert _is_submittable(app.solve_captcha(b"not a png"))
 
 
-def test_solve_returns_six_digits_or_nothing():
+def test_solve_pads_real_samples_to_six_digits():
     samples = glob.glob(os.path.join(app.SAMPLE_DIR, "unlabeled", "*.png"))
     assert samples, "no captcha samples to check against"
     for path in samples:
         guess = app.solve_captcha(open(path, "rb").read())
-        assert guess == "" or (len(guess) == 6 and guess.isdigit()), f"{path} -> {guess!r}"
+        assert _is_submittable(guess), f"{path} -> {guess!r}"
 
 
 def test_save_sample_round_trips():
@@ -56,7 +63,7 @@ class _FakeRow:
         return self._cells
 
 
-def test_extract_hsns_skips_headers_and_placeholders():
+def test_extract_hsn_rows_keeps_descriptions_and_skips_headers():
     rows = [
         _FakeRow(),                                              # 'Goods | Services' spanning row
         _FakeRow("HSN", "Description", "HSN", "Description"),     # header, and it is <td>
@@ -65,25 +72,103 @@ def test_extract_hsns_skips_headers_and_placeholders():
         _FakeRow("NA", "", "", ""),
         _FakeRow("1001", "WHEAT AGAIN", "", ""),                  # duplicate
     ]
-    assert app.extract_hsns(rows) == ["00440177", "1001", "00440048"]
+    assert app.extract_hsn_rows(rows) == [
+        ("Services", "00440177", "PORT SERVICES"),
+        ("Goods", "1001", "WHEAT"),
+        ("Services", "00440048", "RENT A CAB"),
+    ]
 
 
-def test_store_appends_and_exports_everything():
+class _FakeDriver:
+    def __init__(self, panels=(), errors=()):
+        self._found = {app.PROFILE_PANEL: list(panels), app.CAPTCHA_ERROR: list(errors)}
+
+    def find_elements(self, by, value):
+        return self._found.get((by, value), [])
+
+
+class _ErrEl:
+    def __init__(self, text, displayed=True):
+        self.text = text
+        self._displayed = displayed
+
+    def is_displayed(self):
+        return self._displayed
+
+
+def test_search_outcome_tells_success_from_refusal():
+    assert app.search_outcome(_FakeDriver()) is None, "neither yet -> keep polling"
+    assert app.search_outcome(_FakeDriver(panels=[object()])) == "found"
+    assert app.search_outcome(
+        _FakeDriver(errors=[_ErrEl("Enter valid letters shown in the image below")])) == "captcha"
+    # An empty or hidden .err sits in the DOM before submit; it must not read as a refusal.
+    assert app.search_outcome(_FakeDriver(errors=[_ErrEl("")])) is None
+    assert app.search_outcome(_FakeDriver(errors=[_ErrEl("boom", displayed=False)])) is None
+
+
+class _FlakyInput:
+    """An input that swallows the first N send_keys, the way Angular does mid-render."""
+    def __init__(self, swallow):
+        self.swallow = swallow
+        self.value = ""
+
+    def clear(self):
+        self.value = ""
+
+    def send_keys(self, text):
+        if self.swallow > 0:
+            self.swallow -= 1
+            return
+        self.value = text
+
+    def get_attribute(self, name):
+        return self.value
+
+
+def test_type_captcha_retries_until_the_value_sticks():
+    good = _FlakyInput(swallow=0)
+    assert app.type_captcha(good, "123456") is True
+    assert good.value == "123456"
+
+    flaky = _FlakyInput(swallow=2)
+    assert app.type_captcha(flaky, "123456") is True, "must retry, not give up on one drop"
+    assert flaky.value == "123456"
+
+    dead = _FlakyInput(swallow=99)
+    assert app.type_captcha(dead, "123456") is False, "must report failure, not submit blank"
+
+
+def test_store_writes_one_row_per_hsn_and_exports_everything():
+    profile = {
+        "Legal Name of Business": "JSW DHARAMTAR PORT PRIVATE LIMITED",
+        "Taxpayer Type": "Regular",
+        "Some Future Field": "kept anyway",     # not in PROFILE_FIELDS
+    }
     tmp = tempfile.mkdtemp()
     original, app.RESULTS_FILE = app.RESULTS_FILE, os.path.join(tmp, "results.csv")
     try:
-        app.append_result("27AAAAA0000A1Z5", "First Co", "1001, 1002")
-        app.append_result("29BBBBB1111B2Z6", "Second Co", "3004")
-        app.append_result("27AAAAA0000A1Z5", "First Co", "1001, 1002, 9999")  # rescrape
+        assert app.append_results("27AACCJ9361Q1ZS", "JSW DPPL", profile, [
+            ("Services", "00440177", "PORT SERVICES"),
+            ("Services", "00440048", "RENT A CAB OPERATORS"),
+        ]) == 2
+        # A taxpayer with no codes still gets a row, so the profile is not lost.
+        assert app.append_results("29BBBBB1111B2Z6", "No Codes Co", profile, []) == 1
 
         out = os.path.join(tmp, "export.xlsx")
-        assert app.export_to_excel(out) == 3, "export must dump every row, including rescrapes"
+        assert app.export_to_excel(out) == 3
 
-        df = pd.read_excel(out)
-        assert list(df.columns) == ["Timestamp", "GSTIN", "Company", "HSNs"]
-        assert df["HSNs"].iloc[2] == "1001, 1002, 9999"
+        # dtype=str on read too: pandas re-infers 00440177 as a number on the way back in,
+        # even though the cell itself is stored as text.
+        df = pd.read_excel(out, dtype=str)
+        assert list(df.columns) == app.RESULT_COLUMNS
+        # Leading zeros are part of the SAC code and must survive the round trip.
+        assert list(df["HSN"][:2]) == ["00440177", "00440048"]
+        assert df["Description"].iloc[0] == "PORT SERVICES"
+        assert df["Legal Name of Business"].iloc[0] == "JSW DHARAMTAR PORT PRIVATE LIMITED"
+        assert "Some Future Field: kept anyway" in df["Other Details"].iloc[0]
+        assert pd.isna(df["HSN"].iloc[2])          # the no-codes taxpayer
         # Header written once, not once per append.
-        assert open(app.RESULTS_FILE).read().count("GSTIN") == 1
+        assert open(app.RESULTS_FILE).read().count("Timestamp") == 1
     finally:
         app.RESULTS_FILE = original
         shutil.rmtree(tmp)

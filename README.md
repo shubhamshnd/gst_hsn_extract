@@ -49,10 +49,31 @@ The window walks through three steps:
 3. **Start Processing** — leave *headless* unchecked the first time so you can watch the
    browser. The progress bar tracks GSTINs completed; the log shows per-attempt detail.
 
-Results append to `gst_hsn_results.csv` with columns
-`Timestamp, GSTIN, Company, HSNs`. **Export Everything to Excel** dumps that entire
-store to a workbook, including repeat scrapes of the same GSTIN — nothing is filtered or
-deduplicated.
+## What gets stored
+
+Results append to `gst_hsn_results.csv`, **one row per HSN/SAC code**, so the sheet
+pivots and filters directly. The full taxpayer profile repeats on every row of a given
+GSTIN, meaning each row stands alone:
+
+| Group | Columns |
+| --- | --- |
+| Run | `Timestamp`, `GSTIN`, `Company` (from your input sheet) |
+| Taxpayer | `Legal Name of Business`, `Trade Name`, `Additional Trade Name`, `Effective Date of registration`, `Constitution of Business`, `GSTIN / UIN Status`, `Taxpayer Type`, `Administrative Office`, `Other Office`, `Principal Place of Business`, `Whether Aadhaar Authenticated?`, `Whether e-KYC Verified?` |
+| Catch-all | `Other Details` — any panel label not named above, so new portal fields are kept rather than silently dropped |
+| Code | `Type` (Goods or Services), `HSN`, `Description` |
+
+A taxpayer with no goods or services listed still gets one row, with the code columns
+blank — the profile is worth keeping on its own.
+
+Jurisdiction fields are multi-line on the portal and are joined with ` | `, e.g.
+`(JURISDICTION - CENTER) | State - CBIC | Zone - MUMBAI | Commissionerate - RAIGARH`.
+
+**Export Everything to Excel** dumps the entire store to a workbook, including repeat
+scrapes of the same GSTIN — nothing is filtered or deduplicated.
+
+> Read the CSV back with `dtype=str`. SAC codes like `00440177` have meaningful leading
+> zeros, and pandas will happily turn them into `440177` otherwise. `export_to_excel`
+> already does this.
 
 ## How the captcha is handled
 
@@ -60,13 +81,23 @@ The portal reveals the captcha only *after* the GSTIN is submitted once, so each
 is a two-stage form. The captcha is always **6 digits**, 182×50 px, over a fixed 6px
 lattice with a red strikethrough line.
 
-`solve_captcha` inpaints the red line out and runs `ddddocr`. If the read is not exactly
-six digits it is discarded without spending a submit, and the page is reloaded for a
-fresh captcha — up to `MAX_CAPTCHA_RETRIES` (8) per GSTIN.
+`solve_captcha` inpaints the red line out, runs `ddddocr`, and **always returns six
+digits**, padding a short read rather than giving up. That is deliberate: a refused
+captcha does not navigate away. The portal keeps the GSTIN filled, clears the captcha box
+and swaps in a fresh image, so a wrong guess is one round trip and doubles as the cheapest
+way to get a new captcha. Reloading the page instead would cost three.
 
-**The generic model is weak here: roughly 1 in 6 reads is exact.** The retry loop absorbs
-that, so expect several `captcha 'NNNNNN' rejected` lines per GSTIN in the log. That is
-normal, not a failure.
+So the page loads **once per GSTIN**, and all `MAX_CAPTCHA_RETRIES` (25) attempts happen
+in place at roughly 1.3s each.
+
+**The generic model is weak here: roughly 1 in 6 reads is exact.** Expect a run of
+`captcha 'NNNNNN' rejected` lines before each success — that is normal, not a failure.
+25 attempts puts the odds of losing a GSTIN near 1 in 100, for about 8s per GSTIN on
+average. Guesses ending in several zeros are padded partial reads.
+
+Success and refusal are detected by watching for the taxpayer panel and the portal's
+`.err` message at the same time, so a refusal is noticed the moment it appears instead of
+costing a full timeout on every retry.
 
 ### Collecting training data
 
@@ -97,9 +128,17 @@ results store. No framework needed.
   interpreter on Windows. The import order in `app.py` is deliberate — don't let an
   autoformatter sort it.
 - The portal drops a `div.dimmer-holder` overlay while loading that silently swallows
-  clicks. Every click waits for it to clear.
+  clicks. It *fades* rather than vanishing and can reappear between the check and the
+  click, so `click_search` retries on interception instead of trusting one wait.
+- `send_keys` into the captcha box is sometimes dropped when Angular re-renders around
+  it, leaving the field empty. `type_captcha` reads the value back and retypes.
+- The taxpayer panel renders **before** the goods/services section, so the HSN table is
+  waited for separately — reading immediately after the panel appears finds nothing.
 - Captcha images are read through a canvas rather than a Selenium element screenshot,
   which comes out scaled by `devicePixelRatio` (228×63 at 1.25) and would not match what
   a trained model expects.
-- Goods and services HSNs are merged into one `HSNs` column. Split them if the
-  distinction matters.
+- The HSN table sits behind `ng-if="!goodServErrMsg"` and is **absent entirely** for a
+  taxpayer with no goods or services. Success is therefore detected on the taxpayer panel
+  (`div.tbl-format`), which always renders, not on the table.
+- `Additional Trade Name` records only the word `View`. The names themselves load from a
+  `getaddltrdnm()` click into a modal, which is not scraped yet.

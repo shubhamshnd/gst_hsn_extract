@@ -9,7 +9,7 @@ import pandas as pd
 import ddddocr  # must be imported BEFORE PyQt5 - the reverse order segfaults on Windows
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -34,7 +34,10 @@ QTextEdit { background: #ffffff; border: 1px solid #d0d3d8; border-radius: 5px;
 """
 
 SAMPLE_DIR = "captcha_samples"
-MAX_CAPTCHA_RETRIES = 8
+# ddddocr lands roughly 1 read in 6, and a retry now costs ~1.3s because a refused
+# captcha refreshes in place. 8 tries left a 1-in-5 chance of losing a GSTIN outright;
+# 25 puts that near 1 in 100, for ~8s per GSTIN on average and ~33s worst case.
+MAX_CAPTCHA_RETRIES = 25
 
 # The running store. Append-only CSV rather than xlsx on purpose: appending a row is one
 # line and survives a crash mid-run, where rewriting a whole workbook every scrape does not.
@@ -60,10 +63,16 @@ _ocr = ddddocr.DdddOcr(show_ad=False)
 
 
 def solve_captcha(png_bytes):
-    """Read a GST captcha. Returns 6 digits, or '' if the read is obviously bad."""
+    """Read a GST captcha. Always returns exactly 6 digits.
+
+    A short or long read is wrong either way, and there is no reason to skip submitting
+    it: the portal rejects a wrong guess in place, swaps in a fresh image and keeps the
+    GSTIN filled, which is one round trip. Reloading the page to get a new captcha costs
+    three. So pad the read out to six and always take the shot.
+    """
     img = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
-        return ""
+        return "000000"
 
     # Inpaint out the red strikethrough line; measurably better than feeding the raw image.
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -73,38 +82,145 @@ def solve_captcha(png_bytes):
 
     text = _ocr.classification(cv2.imencode('.png', cleaned)[1].tobytes())
     digits = "".join(c for c in text if c.isdigit())
-    # The captcha is always 6 digits, so anything else is a misread - don't spend a submit on it.
-    return digits if len(digits) == 6 else ""
+    return (digits + "000000")[:6]
 
 
-RESULT_COLUMNS = ["Timestamp", "GSTIN", "Company", "HSNs"]
+# Taxpayer panel fields, in the order the portal lays them out. Fixed rather than
+# "whatever labels turn up", because this is an append-only store and the header has to
+# stay stable across runs. Conditional fields simply come back empty.
+PROFILE_FIELDS = [
+    "Legal Name of Business",
+    "Trade Name",
+    "Additional Trade Name",
+    "Effective Date of registration",
+    "Constitution of Business",
+    "GSTIN / UIN Status",
+    "Taxpayer Type",
+    "Administrative Office",
+    "Other Office",
+    "Principal Place of Business",
+    "Whether Aadhaar Authenticated?",
+    "Whether e-KYC Verified?",
+]
+
+RESULT_COLUMNS = (["Timestamp", "GSTIN", "Company"] + PROFILE_FIELDS
+                  + ["Other Details", "Type", "HSN", "Description"])
+
+# The taxpayer panel is always rendered on a successful search. The HSN table is not -
+# it sits behind ng-if="!goodServErrMsg" and vanishes when a taxpayer lists no goods or
+# services - so the panel, not the table, is what tells an accepted captcha from a refused one.
+PROFILE_PANEL = (By.CSS_SELECTOR, "div.tbl-format")
+
+# Shown as "Enter valid letters shown in the image below" when a captcha is refused.
+CAPTCHA_ERROR = (By.CSS_SELECTOR, ".err")
+
+HSN_TABLE = (By.XPATH, "//table[contains(@class, 'table-bordered')]")
+HSN_ROWS = (By.XPATH, "//table[contains(@class, 'table-bordered')]//tr")
+
+
+def search_outcome(driver):
+    """'found', 'captcha', or None while neither has appeared yet.
+
+    Watching for both means a refused captcha is noticed the moment the portal says so,
+    instead of costing a full timeout on the success condition every single retry.
+    """
+    if driver.find_elements(*PROFILE_PANEL):
+        return "found"
+    for element in driver.find_elements(*CAPTCHA_ERROR):
+        if element.is_displayed() and element.text.strip():
+            return "captcha"
+    return None
 
 # The results table is [Goods HSN | Goods Desc | Services HSN | Services Desc], and its
 # header row is <td> inside <tbody>, so position alone cannot tell data from heading.
-HSN_COLUMNS = (0, 2)
+HSN_LAYOUT = (("Goods", 0, 1), ("Services", 2, 3))
 
 
-def extract_hsns(rows):
-    """Pull HSN/SAC codes out of the results table, goods and services alike.
+def _tidy(text):
+    """Collapse the portal's stray whitespace so labels match and cells stay readable."""
+    return " ".join(text.split())
 
-    Codes are numeric, which is what separates them from the 'HSN' header cell and
-    from 'NA' placeholders. Order is preserved and duplicates dropped.
+
+def extract_hsn_rows(rows):
+    """[(kind, code, description)] for every HSN/SAC in the results table.
+
+    Codes are numeric, which is what separates them from the 'HSN' header cell and from
+    'NA' placeholders. Order is preserved and repeats dropped.
     """
-    # ponytail: goods and services are merged into one list, matching the single HSNs
-    # column. Split into two columns if the distinction ever matters.
     found = []
+    seen = set()
     for row in rows:
         cells = row.find_elements(By.XPATH, './td')
-        for index in HSN_COLUMNS:
-            if index < len(cells):
-                text = cells[index].text.strip()
-                if text.isdigit() and text not in found:
-                    found.append(text)
+        for kind, code_index, desc_index in HSN_LAYOUT:
+            if code_index >= len(cells):
+                continue
+            code = _tidy(cells[code_index].text)
+            if not code.isdigit() or (kind, code) in seen:
+                continue
+            seen.add((kind, code))
+            description = _tidy(cells[desc_index].text) if desc_index < len(cells) else ""
+            found.append((kind, code, description))
     return found
 
 
-def append_result(gstin, company, hsns):
-    """One scraped row onto the end of the store. Written immediately, not batched."""
+def click_search(driver, wait, attempts=5):
+    """Press SEARCH, working around the loading overlay that swallows clicks.
+
+    The overlay fades out rather than vanishing, and can come back between the check and
+    the click, so a single invisibility wait is not enough - retry on interception.
+    """
+    for _ in range(attempts):
+        try:
+            wait.until(EC.invisibility_of_element_located(DIMMER))
+            driver.find_element(By.ID, "lotsearch").click()
+            return True
+        except ElementClickInterceptedException:
+            time.sleep(0.5)
+    return False
+
+
+def type_captcha(element, guess, attempts=3):
+    """Type the guess and confirm it actually landed.
+
+    Angular re-renders the form around this input, and a send_keys that lands mid-render
+    is silently dropped - the field stays empty and the submit is wasted. Reading the
+    value back is the only way to know it stuck.
+    """
+    for _ in range(attempts):
+        element.clear()
+        element.send_keys(guess)
+        if element.get_attribute("value") == guess:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def extract_profile(driver):
+    """Label -> value for every field in the taxpayer detail panel.
+
+    Each field is a column div holding a <strong> label followed by either value
+    paragraphs, a <ul> of jurisdiction lines, or a link. All three shapes are read the
+    same way so nothing in the panel is skipped.
+    """
+    profile = {}
+    for col in driver.find_elements(By.CSS_SELECTOR, "div.tbl-format div.col-sm-4"):
+        labels = col.find_elements(By.TAG_NAME, "strong")
+        if not labels:
+            continue
+        # The label shares its <p> with the strong; value paragraphs never contain one.
+        values = [_tidy(p.text) for p in col.find_elements(By.XPATH, './p')
+                  if not p.find_elements(By.TAG_NAME, 'strong') and p.text.strip()]
+        values += [_tidy(li.text) for li in col.find_elements(By.XPATH, './ul/li')
+                   if li.text.strip()]
+        # ponytail: Additional Trade Name is only a "View" link - the names themselves sit
+        # behind a click. Recording the link at least says the data exists.
+        values += [_tidy(a.text) for a in col.find_elements(By.XPATH, './a') if a.text.strip()]
+        profile[_tidy(labels[0].text)] = " | ".join(values)
+    return profile
+
+
+def append_results(gstin, company, profile, hsn_rows):
+    """Append one row per HSN. Profile fields repeat so every row stands alone in Excel."""
     # A store written by an older version has a different header. Appending under it makes
     # a CSV pandas cannot parse, so roll it aside instead of corrupting either one.
     if os.path.exists(RESULTS_FILE):
@@ -113,18 +229,26 @@ def append_result(gstin, company, hsns):
         if header != RESULT_COLUMNS:
             os.rename(RESULTS_FILE, f"{RESULTS_FILE}.{time.strftime('%Y%m%d%H%M%S')}.old")
 
-    row = pd.DataFrame({
-        "Timestamp": [time.strftime("%Y-%m-%d %H:%M:%S")],
-        "GSTIN": [gstin],
-        "Company": [company],
-        "HSNs": [hsns],
-    })
-    row.to_csv(RESULTS_FILE, mode='a', header=not os.path.exists(RESULTS_FILE), index=False)
+    base = {"Timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "GSTIN": gstin, "Company": company}
+    base.update({field: profile.get(field, "") for field in PROFILE_FIELDS})
+    # Any label the portal shows that PROFILE_FIELDS does not name is kept, not dropped.
+    extras = {k: v for k, v in profile.items() if k not in PROFILE_FIELDS}
+    base["Other Details"] = " ; ".join(f"{k}: {v}" for k, v in extras.items())
+
+    # A taxpayer with no codes listed still deserves a row - the profile is the find.
+    records = [dict(base, Type=kind, HSN=code, Description=description)
+               for kind, code, description in (hsn_rows or [("", "", "")])]
+
+    frame = pd.DataFrame(records, columns=RESULT_COLUMNS)
+    frame.to_csv(RESULTS_FILE, mode='a', header=not os.path.exists(RESULTS_FILE), index=False)
+    return len(records)
 
 
 def export_to_excel(path):
     """Dump the whole store to a workbook. Returns how many rows went out."""
-    df = pd.read_csv(RESULTS_FILE)
+    # dtype=str or pandas reads 00440177 as the number 440177 and the leading zeros,
+    # which are part of the SAC code, are gone. Every column here is text anyway.
+    df = pd.read_csv(RESULTS_FILE, dtype=str)
     df.to_excel(path, index=False)
     return len(df)
 
@@ -167,6 +291,8 @@ class ScraperThread(QThread):
         wait = WebDriverWait(driver, 10)
         # Shorter: a wrong captcha means waiting this out on every retry.
         result_wait = WebDriverWait(driver, 6)
+        # Only paid once per successful scrape, so it can afford to be patient.
+        table_wait = WebDriverWait(driver, 8)
         
         total = int(df["GSTIN"].notna().sum()) if "GSTIN" in df.columns else 0
         done = 0
@@ -181,64 +307,100 @@ class ScraperThread(QThread):
             if pd.isna(gstin):
                 continue
 
+            try:
+                # Loaded once per GSTIN, not once per attempt: a rejected captcha leaves us
+                # on this page with the GSTIN still filled and a fresh captcha already
+                # loaded, so retrying costs one round trip instead of three.
+                driver.get("https://services.gst.gov.in/services/searchtp")
+
+                gstin_input = wait.until(EC.presence_of_element_located((By.ID, "for_gstin")))
+                gstin_input.clear()
+                gstin_input.send_keys(str(gstin))
+
+                # The captcha is not in the DOM until the GSTIN is submitted once.
+                if not click_search(driver, wait):
+                    raise TimeoutException("SEARCH stayed covered by the loading overlay")
+            except Exception as e:
+                self.progress_signal.emit(f"Error on {gstin}: {str(e)}")
+                done += 1
+                self.count_signal.emit(done, total)
+                continue
+
+            previous_src = None
             for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
                 if not self._is_running:
                     break
                 try:
-                    # A fresh page load is also a fresh captcha.
-                    driver.get("https://services.gst.gov.in/services/searchtp")
-
-                    gstin_input = wait.until(EC.presence_of_element_located((By.ID, "for_gstin")))
-                    gstin_input.clear()
-                    gstin_input.send_keys(str(gstin))
-
-                    # The captcha is not in the DOM until the GSTIN is submitted once.
-                    wait.until(EC.invisibility_of_element_located(DIMMER))
-                    driver.find_element(By.ID, "lotsearch").click()
                     captcha_img = wait.until(EC.visibility_of_element_located((By.ID, "imgCaptcha")))
+                    # After a rejection the portal swaps in a new image. Waiting for the src
+                    # to change stops us re-reading - and re-banking - the stale one.
+                    if previous_src:
+                        wait.until(lambda d: d.find_element(
+                            By.ID, "imgCaptcha").get_attribute("src") != previous_src)
+                        captcha_img = driver.find_element(By.ID, "imgCaptcha")
+                    previous_src = captcha_img.get_attribute("src")
+
                     # Reading a half-loaded img poisons both the guess and the sample.
                     wait.until(lambda d: d.execute_script(
                         "return arguments[0].complete && arguments[0].naturalWidth > 0", captcha_img))
                     png = base64.b64decode(driver.execute_script(CAPTCHA_PNG_JS, captcha_img))
 
                     guess = solve_captcha(png)
-                    if not guess:
+
+                    captcha_input = wait.until(EC.element_to_be_clickable((By.ID, "fo-captcha")))
+                    if not type_captcha(captcha_input, guess):
                         save_sample(png)
-                        self.progress_signal.emit(f"{gstin}: unreadable captcha ({attempt}/{MAX_CAPTCHA_RETRIES})")
+                        self.progress_signal.emit(
+                            f"{gstin}: captcha box would not accept input ({attempt}/{MAX_CAPTCHA_RETRIES})")
                         continue
 
-                    captcha_input = driver.find_element(By.ID, "fo-captcha")
-                    captcha_input.clear()
-                    captcha_input.send_keys(guess)
-                    wait.until(EC.invisibility_of_element_located(DIMMER))
-                    driver.find_element(By.ID, "lotsearch").click()
+                    if not click_search(driver, wait):
+                        self.progress_signal.emit(
+                            f"{gstin}: SEARCH stayed covered ({attempt}/{MAX_CAPTCHA_RETRIES})")
+                        continue
 
-                    # No results table at all means the captcha was refused - the portal
-                    # re-renders the form instead. A valid GSTIN with no codes still gets a
-                    # table, so this distinguishes the two cases rather than guessing.
+                    # Watch for either outcome instead of timing out on the good one. A
+                    # rejection is announced immediately, so this no longer costs a full wait.
                     try:
-                        rows = result_wait.until(EC.presence_of_all_elements_located(
-                            (By.XPATH, "//table[contains(@class, 'table-bordered')]//tr")
-                        ))
+                        outcome = result_wait.until(search_outcome)
                     except TimeoutException:
+                        outcome = None
+
+                    if outcome != "found":
                         save_sample(png)
-                        self.progress_signal.emit(f"{gstin}: captcha '{guess}' rejected ({attempt}/{MAX_CAPTCHA_RETRIES})")
+                        self.progress_signal.emit(
+                            f"{gstin}: captcha '{guess}' rejected ({attempt}/{MAX_CAPTCHA_RETRIES})")
                         continue
 
                     # The portal accepted it, so the guess is ground truth - free training label.
                     save_sample(png, guess)
 
-                    hsn_string = ", ".join(extract_hsns(rows))
+                    profile = extract_profile(driver)
+
+                    # The panel renders before the goods/services section, so reading
+                    # straight away finds an empty page. Give the table a moment to arrive;
+                    # a taxpayer that genuinely has none just times out and yields zero rows.
+                    try:
+                        table_wait.until(EC.presence_of_element_located(HSN_TABLE))
+                    except TimeoutException:
+                        pass
+                    hsn_rows = extract_hsn_rows(driver.find_elements(*HSN_ROWS))
 
                     # Save immediately to prevent data loss
-                    append_result(gstin, row.get("Company"), hsn_string)
+                    written = append_results(gstin, row.get("Company"), profile, hsn_rows)
 
-                    self.progress_signal.emit(f"Successfully scraped: {gstin} (attempt {attempt})")
+                    name = profile.get("Legal Name of Business", "")
+                    self.progress_signal.emit(
+                        f"Scraped {gstin} {('- ' + name) if name else ''} "
+                        f"({len(hsn_rows)} HSN, {written} row(s), attempt {attempt})")
                     break
 
                 except Exception as e:
-                    self.progress_signal.emit(f"Error on {gstin}: {str(e)}")
-                    break
+                    # Angular swapping elements mid-attempt is transient; the next pass
+                    # re-finds everything. MAX_CAPTCHA_RETRIES bounds it either way.
+                    self.progress_signal.emit(
+                        f"{gstin}: retrying after {type(e).__name__} ({attempt}/{MAX_CAPTCHA_RETRIES})")
+                    continue
             else:
                 self.progress_signal.emit(f"Gave up on {gstin} after {MAX_CAPTCHA_RETRIES} captcha attempts")
 
