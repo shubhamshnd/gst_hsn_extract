@@ -1,0 +1,20 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Scraped output: the local results store, its rolled-aside backups, and exports.
+# Also covers input sheets, which hold client GSTIN lists and do not belong in git.
+*.csv
+*.xlsx
+*.xls
+*.old
+
+# Captcha collection. The unlabelled pile grows without bound, so it stays local -
+# except the handful of seed samples test_captcha.py checks against.
+# The labelled set IS the training data, so it is tracked.
+captcha_samples/unlabeled/*
+!captcha_samples/unlabeled/c?.png
