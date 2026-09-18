@@ -100,10 +100,11 @@ way to get a new captcha. Reloading the page instead would cost three.
 So the page loads **once per GSTIN**, and all `MAX_CAPTCHA_RETRIES` (40) attempts happen
 in place at roughly 0.9s each.
 
-**The generic model is weak here: measured across live runs, about 1 read in 10 is
-exact.** Expect a long run of `captcha 'NNNNNN' rejected` lines before each success —
-that is normal, not a failure. 40 attempts leaves roughly a 2% chance of losing a GSTIN,
-at about 10s per GSTIN on average. Guesses ending in several zeros are padded partial
+The reader is **`ddddocr`'s beta model** (`DdddOcr(beta=True)`), measured at roughly twice
+the accuracy of its default on these captchas — see [Accuracy](#accuracy). Even so it
+lands only about **1 read in 6**, so expect a run of `captcha 'NNNNNN' rejected` lines
+before each success. That is normal, not a failure. 40 attempts makes losing a GSTIN very
+unlikely, at roughly 6s per GSTIN. Guesses ending in several zeros are padded partial
 reads.
 
 A GSTIN that exhausts its retries is **not** written to the store, so the next run picks
@@ -112,6 +113,49 @@ it up again automatically.
 Success and refusal are detected by watching for the taxpayer panel and the portal's
 `.err` message at the same time, so a refusal is noticed the moment it appears instead of
 costing a full timeout on every retry.
+
+## Accuracy
+
+Measured on two sets: **A** = 83 captchas the portal accepted (labels certain), **B** =
+20 the portal refused, read by eye. Default solves 100% of A and 0% of B *by
+construction*. Weighting by the ~10% of captchas the default model solves:
+
+| Reader | Set A | Set B | Weighted |
+| --- | --- | --- | --- |
+| `DdddOcr()` default | 100% | 0% | ~10% |
+| `DdddOcr(beta=True)` | 66% | 15% | **~20%** |
+
+Confirmed live: 5 successes in 31 attempts (16%) with beta, against 5 in 56 (9%) before.
+
+Things that were tried and did **not** help:
+
+- **Un-warping the image.** There is no geometric distortion; the lattice is perfectly
+  straight. A 240-combination sweep moved character accuracy by noise.
+- **Preprocessing variants.** Median blur, thresholding, morphological closing, lattice
+  inpainting — all scored at or below plain red-line inpainting.
+- **Ensembling the two models.** When they agree on a hard captcha they agree on a *wrong*
+  answer (0/6, confirmed by the portal rejecting those guesses), so agreement is not a
+  usable confidence signal and voting cannot beat beta alone.
+
+### To go further, train on this font
+
+A network trained on this specific font and lattice should clear 95%. The obstacle is
+labels, not modelling.
+
+> **`captcha_samples/labeled/` is a biased set.** It contains exactly the captchas the
+> current reader already solves, so training on it alone distils the existing model
+> rather than improving on it. Measured: the default reader scores 100% on it.
+
+Three ways round that, best first:
+
+1. **Synthesise training data.** The font, the 6px lattice and the red line are all
+   fixed and reproducible. Generating unlimited correctly-labelled captchas sidesteps the
+   labelling problem entirely.
+2. **Bootstrap.** Train on what you have, deploy it, and it will accept captchas the old
+   reader could not — which widens `labeled/` for the next round. Repeat.
+3. **Hand-label the hard half.** `captcha_samples/unlabeled/` is the set the reader
+   fails, so a few hundred labelled by eye are worth far more than the easy ones. Be
+   warned they are hard to read even for a person.
 
 ### Collecting training data
 

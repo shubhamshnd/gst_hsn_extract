@@ -63,10 +63,12 @@ c.getContext('2d').drawImage(img, 0, 0);
 return c.toDataURL('image/png').split(',')[1];
 """
 
-# ponytail: ddddocr's generic model scores ~1/6 exact on real GST captchas. The retry
-# loop absorbs that. Swap this for a model trained on captcha_samples/labeled once
-# enough of those have piled up.
-_ocr = ddddocr.DdddOcr(show_ad=False)
+# beta=True picks ddddocr's second bundled model. Measured on real GST captchas it lands
+# ~20% against the default model's ~10%, including 3/20 of the ones the default misses
+# outright. Costs nothing - same call, same speed.
+# ponytail: still a generic model. A net trained on this font would clear 95%; see the
+# training-data note in README before trusting captcha_samples/labeled for that.
+_ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 
 
 def solve_captcha(png_bytes):
@@ -371,7 +373,9 @@ class ScraperThread(QThread):
                     "Everything scraped so far is saved; press Start to resume.")
                 break
             except Exception as e:
-                self.progress_signal.emit(f"Error on {gstin}: {str(e)}")
+                # Some selenium errors carry an empty message; the class name is the clue.
+                self.progress_signal.emit(
+                    f"Error on {gstin}: {type(e).__name__} {str(e).strip() or '(no detail)'}")
                 done += 1
                 self.count_signal.emit(done, total)
                 continue
